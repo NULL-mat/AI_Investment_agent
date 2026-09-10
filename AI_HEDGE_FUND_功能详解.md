@@ -1499,3 +1499,64 @@ SQLite `busy_timeout` 和指数退避重试处理并发写入。环境变量
 
 扩展 CLI 已改用 `CachedAShareDataClient`，执行
 `python -m ashare_extension.cli 600519 --kind all --refresh` 可以在单次运行中绕过两层缓存。
+
+## 新增：公共网络可靠性层与独立 News Engine
+
+本次新增内容位于 `infrastructure/network/` 和 `news/`，不修改
+`hedge_fund/` 的 Fund、Strategy、Alpha、Portfolio、Risk、Backtest 主流程，也未复制
+`A_Share_investment_Agent` 源码。
+
+### 网络可靠性层
+
+`infrastructure/network/retry_policy.py` 使用 `tenacity` 提供重试、指数退避和 jitter。
+AKShare、BaoStock、Tavily（以及正文抓取）各自读取独立的环境变量配置，例如：
+
+```text
+AKSHARE_RETRY_MAX_ATTEMPTS=3
+AKSHARE_RETRY_INITIAL_DELAY=0.5
+AKSHARE_RETRY_MAX_DELAY=8
+AKSHARE_RETRY_JITTER=0.25
+BAOSTOCK_RETRY_MAX_ATTEMPTS=3
+TAVILY_RETRY_MAX_ATTEMPTS=3
+```
+
+`ProxyPool` 负责代理轮询和 direct fallback。AKShare 可配置
+`AKSHARE_PROXY_LIST`、`AKSHARE_PROXY_ALLOW_DIRECT`、`AKSHARE_PROXY_FORCE_DIRECT`；
+BaoStock 使用对应的 `BAOSTOCK_PROXY_*` 参数。requests 请求通过 `proxies` 参数路由，
+只对不支持该参数的 BaoStock socket 连接使用单次 attempt 的环境上下文。
+
+网络临时错误、408、5xx 和 429 会按 provider policy 重试；401/403、400/404/422 和参数错误
+立即失败。空列表、空 DataFrame 或空 JSON 由 provider 正常返回，不会被转换成网络错误。
+最终失败抛出 `ProviderRequestError`、`ProviderRateLimitError`、`ProviderAuthError` 或
+`ProviderParameterError`。日志统一包含 provider、attempt、latency_ms、error_type 和脱敏
+代理标签，不记录 API Key、完整响应正文或代理凭据。
+
+### News Engine
+
+`news/service.py` 编排以下链路：
+
+```text
+QueryBuilder -> SearchProvider -> ContentFetcher -> Normalizer
+             -> Deduplicator -> NewsCache -> NewsItem / Evidence
+```
+
+`TavilySearchProvider` 是默认搜索适配器，API Key 只从 `TAVILY_API_KEY` 读取。查询由
+股票代码、公司名、行业和 Agent 类型构建，并传递日期窗口、结果数量以及 include/exclude
+domains。正文不足时可注入 `RequestsContentFetcher`，另预留 Firecrawl 适配器。
+
+所有结果统一为 `NewsItem(title, source, url, published_at, content, ticker, query, provider)`。
+URL（去除追踪参数）、标题和正文均参与指纹去重；日期窗口为闭区间。`NewsCache` 的 key
+包含 query、ticker、日期范围、provider、结果数量和域名过滤条件，支持缓存命中与显式
+`incremental=True` 的增量合并。Provider 失败时按注入顺序切换备用 provider；全部失败时
+抛出 `NewsProviderError`，不会伪造新闻。News Engine 不执行 sentiment 或投资结论。
+
+### 测试与验证
+
+新增 `infrastructure/network/tests/` 和 `news/tests/`，覆盖 tenacity 重试、代理直连回退、
+429、401、最终失败、新闻 URL/标题/正文去重、日期过滤、provider fallback、缓存命中和增量
+更新。`scrapy312` 中已完成真实 BaoStock 登录/交易日查询和 AkShare 腾讯行情 smoke test。
+
+### 原始文件修改标记
+
+本次只修改 A 股扩展调用适配器、公共基础设施、新闻模块、测试、依赖和本说明文档；
+`hedge_fund/` 核心主流程保持不变。

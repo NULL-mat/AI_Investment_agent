@@ -19,8 +19,14 @@ if (_LOCAL_AKSHARE_ROOT / "akshare" / "__init__.py").exists():
 import pandas as pd
 
 from .sqlite_cache import AkshareSQLiteCache
-from ..network.proxy_manager import proxy_manager
 from .baostock_client import format_symbol, query_history_k_data_plus, query_trade_dates
+from infrastructure.network import (
+    ProviderError,
+    ProxyPool,
+    ProviderRetryPolicy,
+    ReliableHttpClient,
+    execute_with_retry,
+)
 import logging
 
 # Column name constants (use unicode escapes to avoid encoding glitches)
@@ -45,6 +51,14 @@ FUND_FLOW_TABLE = "stock_individual_fund_flow"
 
 logger = logging.getLogger("ashare_extension.akshare_cache")
 cache = AkshareSQLiteCache(CACHE_PATH)
+AKSHARE_RETRY_POLICY = ProviderRetryPolicy.from_env("akshare")
+AKSHARE_PROXY_POOL = ProxyPool.from_env("akshare")
+AKSHARE_HTTP_CLIENT = ReliableHttpClient(
+    "akshare",
+    policy=AKSHARE_RETRY_POLICY,
+    proxy_pool=AKSHARE_PROXY_POOL,
+    logger=logger,
+)
 
 
 class _LazyAkshare:
@@ -70,11 +84,20 @@ def _log_cache_upsert(label: str, symbol: str, rows: int, extra: str = "") -> No
 
 
 def _call_with_retry(func, label: str):
-    try:
-        return proxy_manager.run(func, label)
-    except Exception as exc:  # noqa: BLE001
-        logger.error(f"AkShare {label} error: {exc}")
-        return None
+    """Run an AkShare operation through the shared reliability layer.
+
+    Empty DataFrames are returned by the provider and remain valid data. Only
+    actual provider/network failures raise, preventing a failed request from
+    being mistaken for an empty dataset.
+    """
+
+    return execute_with_retry(
+        "akshare",
+        func,
+        policy=AKSHARE_RETRY_POLICY,
+        proxy_pool=AKSHARE_PROXY_POOL,
+        log=logger,
+    )
 
 
 def _drop_cache_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -121,11 +144,13 @@ def get_stock_spot_row(
 
     # The single-symbol Tencent endpoint is substantially smaller and is also
     # reachable on networks where Eastmoney closes the proxy connection.
-    df = _call_with_retry(lambda: _query_stock_spot_tx(stock_code), "stock_spot_tx")
-    if df is None or df.empty:
+    try:
+        df = _call_with_retry(lambda: _query_stock_spot_tx(stock_code), "stock_spot_tx")
+    except ProviderError as first_error:
+        logger.warning("AkShare spot primary provider failed; trying fallback", extra={"provider": "akshare", "error_type": first_error.error_type})
         df = _call_with_retry(lambda: ak.stock_zh_a_spot_em(), "stock_zh_a_spot_em")
-    if df is None:
-        return None
+    if df.empty:
+        df = _call_with_retry(lambda: ak.stock_zh_a_spot_em(), "stock_zh_a_spot_em")
 
     if df is None or df.empty or COL_CODE not in df.columns:
         return None
@@ -145,10 +170,8 @@ def get_stock_spot_row(
 
 def _query_stock_spot_tx(stock_code: str) -> pd.DataFrame:
     """Return one Tencent quote using AkShare-compatible Chinese columns."""
-    import requests
-
     market = format_symbol(stock_code).split(".", 1)[0]
-    response = requests.get(
+    response = AKSHARE_HTTP_CLIENT.get(
         f"https://qt.gtimg.cn/q={market}{stock_code}",
         timeout=15,
         headers={
@@ -355,8 +378,6 @@ def get_fund_flow(
 
 def _query_fund_flow_http(stock_code: str, market: str) -> pd.DataFrame:
     """AkShare-compatible query using HTTP for proxies that reject HTTPS CONNECT."""
-    import requests
-
     market_map = {"sh": 1, "sz": 0, "bj": 0}
     url = "http://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"
     params = {
@@ -368,7 +389,7 @@ def _query_fund_flow_http(stock_code: str, market: str) -> pd.DataFrame:
         "ut": "b2884a393a59ad64002292a3e90d46a5",
         "_": int(time.time() * 1000),
     }
-    response = requests.get(
+    response = AKSHARE_HTTP_CLIENT.get(
         url,
         params=params,
         timeout=15,

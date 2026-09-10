@@ -30,6 +30,16 @@
     "provider": "OpenAI"
   },
   {
+    "display_name": "GPT-5.5",
+    "model_name": "gpt-5.5",
+    "provider": "OpenAI"
+  },
+  {
+    "display_name": "GPT-4.1 Free (AIHubMix)",
+    "model_name": "gpt-4.1-free",
+    "provider": "OpenAI"
+  },
+  {
     "display_name": "GPT-6 Astra",
     "model_name": "gpt-6-astra",
     "provider": "OpenAI"

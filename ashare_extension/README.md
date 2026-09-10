@@ -105,3 +105,18 @@ SQLite lock wait in seconds; the default is `30`.
 
 The extension CLI uses this facade by default. Add `--refresh` to any CLI
 command to bypass both cache layers for that run.
+
+## Shared network and news infrastructure
+
+External calls made by the A-share adapters use the repository-level
+`infrastructure.network` layer. Configure provider-specific tenacity policies
+with `AKSHARE_RETRY_*`, `BAOSTOCK_RETRY_*`, and `TAVILY_RETRY_*` variables.
+Existing `AKSHARE_PROXY_*` and `BAOSTOCK_MAX_ATTEMPTS` names remain accepted as
+compatibility aliases. Proxy lists are rotated per attempt and end with a
+direct fallback when `*_PROXY_ALLOW_DIRECT=true`.
+
+The independent `news` package provides `NewsEngine`, `TavilySearchProvider`,
+optional `RequestsContentFetcher`, normalized `NewsItem`/`Evidence`, URL/title/
+content de-duplication, date filtering, provider fallback, and a query/date/
+provider keyed JSON cache. It does not perform sentiment analysis or produce
+investment decisions.

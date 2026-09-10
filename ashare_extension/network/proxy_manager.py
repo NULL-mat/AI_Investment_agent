@@ -1,129 +1,60 @@
-"""Proxy rotation and retry utilities for outbound HTTP calls."""
+"""Backward-compatible facade over :mod:`infrastructure.network`.
+
+New provider code should import ``ProxyPool`` and ``execute_with_retry`` from
+the infrastructure package directly. This facade remains so downstream A
+Share integrations do not break while the retry/proxy implementation has one
+owner.
+"""
 
 from __future__ import annotations
 
-import os
-import random
-import time
-from contextlib import contextmanager
-from itertools import cycle
-from typing import Callable, Iterable, List, Optional
+from typing import Callable, Iterable
+
+from infrastructure.network import ProxyPool, ProviderRetryPolicy, execute_with_retry
 
 
 class ProxyManager:
-    """Apply rotating proxies with retry/backoff semantics."""
+    """Compatibility wrapper with no local retry or backoff implementation."""
 
     def __init__(
         self,
-        proxies: Optional[Iterable[str]],
+        proxies: Iterable[str] | None = None,
         *,
         max_attempts: int = 3,
-        base_delay: float = 1.0,
-        max_delay: float = 15.0,
-        jitter: float = 0.5,
+        base_delay: float = 0.5,
+        max_delay: float = 8.0,
+        jitter: float = 0.25,
         logger=None,
     ) -> None:
-        proxy_list = [p.strip() for p in (proxies or []) if p.strip()]
-        self._proxies: List[str] = proxy_list
-        self._cycle = cycle(proxy_list) if proxy_list else None
-        self.max_attempts = max(1, max_attempts)
-        self.base_delay = max(0.0, base_delay)
-        self.max_delay = max(self.base_delay, max_delay)
-        self.jitter = max(0.0, jitter)
+        self.pool = ProxyPool(proxies or (), allow_direct=True)
+        self.policy = ProviderRetryPolicy(
+            provider="akshare",
+            max_attempts=max_attempts,
+            initial_delay=base_delay,
+            max_delay=max_delay,
+            jitter=jitter,
+        )
         self.logger = logger
 
     @classmethod
     def from_env(cls, logger=None) -> "ProxyManager":
-        force_direct = os.getenv("AKSHARE_PROXY_FORCE_DIRECT", "false").lower() in (
-            "1",
-            "true",
-            "yes",
-        )
-        if force_direct:
-            proxies = ["direct"]
-        else:
-            raw = os.getenv("AKSHARE_PROXY_LIST", "").replace(";", ",")
-            proxies = [item.strip() for item in raw.split(",") if item.strip()]
-            allow_direct = os.getenv("AKSHARE_PROXY_ALLOW_DIRECT", "true").lower() in (
-                "1",
-                "true",
-                "yes",
-            )
-            if allow_direct and "direct" not in [p.lower() for p in proxies]:
-                proxies.insert(0, "direct")
+        pool = ProxyPool.from_env("akshare")
+        policy = ProviderRetryPolicy.from_env("akshare")
+        manager = cls([], logger=logger)
+        manager.pool = pool
+        manager.policy = policy
+        return manager
 
-        max_attempts = int(os.getenv("AKSHARE_PROXY_MAX_ATTEMPTS", "3"))
-        base_delay = float(os.getenv("AKSHARE_PROXY_BASE_DELAY", "1"))
-        max_delay = float(os.getenv("AKSHARE_PROXY_MAX_DELAY", "15"))
-        jitter = float(os.getenv("AKSHARE_PROXY_JITTER", "0.5"))
-        return cls(
-            proxies,
-            max_attempts=max_attempts,
-            base_delay=base_delay,
-            max_delay=max_delay,
-            jitter=jitter,
-            logger=logger,
+    def run(self, func: Callable, label: str):
+        return execute_with_retry(
+            "akshare",
+            func,
+            policy=self.policy,
+            proxy_pool=self.pool,
+            log=self.logger,
         )
 
-    def _log(self, level: str, message: str) -> None:
-        if self.logger:
-            getattr(self.logger, level, self.logger.info)(message)
 
-    def _next_proxy(self) -> Optional[str]:
-        if not self._cycle:
-            return None
-        return next(self._cycle)
-
-    @contextmanager
-    def _apply_proxy(self, proxy: Optional[str]):
-        previous = {
-            key: os.environ.get(key)
-            for key in ("HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY")
-        }
-        try:
-            if proxy and proxy.lower() != "direct":
-                os.environ["HTTP_PROXY"] = proxy
-                os.environ["HTTPS_PROXY"] = proxy
-                os.environ.pop("NO_PROXY", None)
-            else:
-                for key in ("HTTP_PROXY", "HTTPS_PROXY"):
-                    os.environ.pop(key, None)
-                os.environ["NO_PROXY"] = "*"
-            yield proxy
-        finally:
-            for key, value in previous.items():
-                if value is None:
-                    os.environ.pop(key, None)
-                else:
-                    os.environ[key] = value
-
-    def _sleep(self, attempt: int) -> None:
-        delay = min(self.base_delay * (2 ** (attempt - 1)), self.max_delay)
-        if self.jitter:
-            delay += random.uniform(0, self.jitter)
-        time.sleep(delay)
-
-    def run(self, func: Callable[[], any], label: str):
-        last_exc: Optional[Exception] = None
-        for attempt in range(1, self.max_attempts + 1):
-            proxy = self._next_proxy()
-            with self._apply_proxy(proxy):
-                try:
-                    return func()
-                except Exception as exc:  # noqa: BLE001
-                    last_exc = exc
-                    self._log(
-                        "warning",
-                        f"{label} attempt {attempt}/{self.max_attempts} failed "
-                        f"using proxy {proxy or 'DIRECT'}: {exc}",
-                    )
-            if attempt < self.max_attempts:
-                self._sleep(attempt)
-        self._log("error", f"{label} failed after {self.max_attempts} attempts.")
-        if last_exc:
-            raise last_exc
-        raise RuntimeError(f"{label} failed without exception detail.")
-
-
-# Shared instance for AkShare flows
 proxy_manager = ProxyManager.from_env()
+
+__all__ = ["ProxyManager", "proxy_manager"]
