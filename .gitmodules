@@ -1,0 +1,6 @@
+[submodule "A_Share_investment_Agent"]
+	path = A_Share_investment_Agent
+	url = https://github.com/24mlight/A_Share_investment_Agent.git
+[submodule "akshare"]
+	path = akshare
+	url = https://github.com/akfamily/akshare.git

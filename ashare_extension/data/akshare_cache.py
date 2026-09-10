@@ -1,0 +1,642 @@
+"""Cached market data helpers backed by SQLite."""
+
+from __future__ import annotations
+
+from datetime import datetime
+import json
+from pathlib import Path
+import os
+import time
+from typing import Dict, List, Optional, Sequence, Tuple
+
+import sys
+
+# The repository contains a vendored AkShare checkout at ``akshare/akshare``.
+# Prefer it when the dependency is not installed in the active environment.
+_LOCAL_AKSHARE_ROOT = Path(__file__).resolve().parents[2] / "akshare"
+if (_LOCAL_AKSHARE_ROOT / "akshare" / "__init__.py").exists():
+    sys.path.insert(0, str(_LOCAL_AKSHARE_ROOT))
+import pandas as pd
+
+from .sqlite_cache import AkshareSQLiteCache
+from ..network.proxy_manager import proxy_manager
+from .baostock_client import format_symbol, query_history_k_data_plus, query_trade_dates
+import logging
+
+# Column name constants (use unicode escapes to avoid encoding glitches)
+COL_CODE = "\u4ee3\u7801"
+COL_NAME = "\u540d\u79f0"
+COL_DATE = "\u65e5\u671f"
+COL_REPORT_DATE = "\u62a5\u544a\u65e5"
+COL_REPORT_TYPE = "\u62a5\u8868\u7c7b\u578b"
+COL_KEYWORD = "\u5173\u952e\u8bcd"
+COL_PUBLISH_TIME = "\u53d1\u5e03\u65f6\u95f4"
+COL_HEADLINE = "\u65b0\u95fb\u6807\u9898"
+COL_CACHE_DATE = "\u7f13\u5b58\u65e5\u671f"
+COL_ADJUST_TYPE = "\u590d\u6743\u7c7b\u578b"
+COL_TRADE_DATE = "trade_date"
+
+BASE_DIR = Path(__file__).resolve().parents[2]
+_default_cache_path = BASE_DIR / "data" / "market_data_cache.db"
+CACHE_PATH = Path(os.getenv("MARKET_CACHE_DB_PATH", str(_default_cache_path)))
+HISTORY_TABLE = "baostock_history_k"
+STOCK_NEWS_EM_TABLE = "stock_news_em_daily"
+FUND_FLOW_TABLE = "stock_individual_fund_flow"
+
+logger = logging.getLogger("ashare_extension.akshare_cache")
+cache = AkshareSQLiteCache(CACHE_PATH)
+
+
+class _LazyAkshare:
+    """Load the vendored/installed AkShare package only when an endpoint runs."""
+
+    def __getattr__(self, name: str):
+        import importlib
+
+        module = importlib.import_module("akshare")
+        return getattr(module, name)
+
+
+ak = _LazyAkshare()
+
+
+def _log_cache_hit(label: str, symbol: str, rows: int) -> None:
+    logger.info("📦 [cache] %s 命中，标的=%s，行数=%d", label, symbol, rows)
+
+
+def _log_cache_upsert(label: str, symbol: str, rows: int, extra: str = "") -> None:
+    suffix = f"（{extra}" if extra else ""
+    logger.info("🆕 [cache] %s 写入完成，标的=%s，新增/更新行数=%d%s", label, symbol, rows, suffix)
+
+
+def _call_with_retry(func, label: str):
+    try:
+        return proxy_manager.run(func, label)
+    except Exception as exc:  # noqa: BLE001
+        logger.error(f"AkShare {label} error: {exc}")
+        return None
+
+
+def _drop_cache_columns(df: pd.DataFrame) -> pd.DataFrame:
+    return df.drop(columns=["缓存时间"], errors="ignore")
+
+
+def _records_to_df(records: List[Dict]) -> pd.DataFrame:
+    if not records:
+        return pd.DataFrame()
+    df = pd.DataFrame(records)
+    return _drop_cache_columns(df)
+
+
+def _resolve_exchange_symbol(symbol: str) -> str:
+    return format_symbol(symbol).replace(".", "")
+
+
+def _plain_symbol(symbol: str) -> str:
+    return format_symbol(symbol).split(".", 1)[1]
+
+
+def get_stock_spot_row(
+    symbol: str,
+    ttl_seconds: int = 600,
+    *,
+    force_refresh: bool = False,
+) -> Optional[pd.Series]:
+    stock_code = format_symbol(symbol).split(".", 1)[1]
+    if force_refresh:
+        logger.info("Force-refreshing realtime quote cache: %s", stock_code)
+    else:
+        cached = cache.fetch_records(
+            table="stock_zh_a_spot_em",
+            filters={COL_CODE: stock_code},
+            ttl_seconds=ttl_seconds,
+            order_by='"缓存时间" DESC',
+            limit=1,
+        )
+        if cached:
+            _log_cache_hit("stock_zh_a_spot_em", stock_code, len(cached))
+            row = cached[0].copy()
+            row.pop("缓存时间", None)
+            return pd.Series(row)
+
+    # The single-symbol Tencent endpoint is substantially smaller and is also
+    # reachable on networks where Eastmoney closes the proxy connection.
+    df = _call_with_retry(lambda: _query_stock_spot_tx(stock_code), "stock_spot_tx")
+    if df is None or df.empty:
+        df = _call_with_retry(lambda: ak.stock_zh_a_spot_em(), "stock_zh_a_spot_em")
+    if df is None:
+        return None
+
+    if df is None or df.empty or COL_CODE not in df.columns:
+        return None
+
+    filtered = df[df[COL_CODE] == stock_code]
+    if filtered.empty:
+        return None
+
+    cache.upsert_records(
+        "stock_zh_a_spot_em",
+        filtered.to_dict("records"),
+        key_columns=[COL_CODE],
+    )
+    _log_cache_upsert("stock_zh_a_spot_em", stock_code, len(filtered))
+    return filtered.iloc[0]
+
+
+def _query_stock_spot_tx(stock_code: str) -> pd.DataFrame:
+    """Return one Tencent quote using AkShare-compatible Chinese columns."""
+    import requests
+
+    market = format_symbol(stock_code).split(".", 1)[0]
+    response = requests.get(
+        f"https://qt.gtimg.cn/q={market}{stock_code}",
+        timeout=15,
+        headers={
+            "User-Agent": "Mozilla/5.0",
+            "Referer": "https://gu.qq.com/",
+        },
+    )
+    response.raise_for_status()
+    text = response.content.decode("gbk", errors="replace")
+    quote = chr(34)
+    if quote not in text:
+        return pd.DataFrame()
+    values = text[text.find(quote) + 1 : text.rfind(quote)].split("~")
+    if len(values) < 47 or not values[2]:
+        return pd.DataFrame()
+
+    def number(index: int, multiplier: float = 1.0) -> float | None:
+        try:
+            return float(values[index]) * multiplier if values[index] else None
+        except (IndexError, TypeError, ValueError):
+            return None
+
+    return pd.DataFrame(
+        [
+            {
+                "序号": 1,
+                COL_CODE: values[2],
+                COL_NAME: values[1],
+                "最新价": number(3),
+                "涨跌幅": number(32),
+                "涨跌额": number(31),
+                "成交量": number(36),
+                "成交额": number(37, 10_000),
+                "振幅": number(43),
+                "最高": number(33),
+                "最低": number(34),
+                "今开": number(5),
+                "昨收": number(4),
+                "量比": number(49),
+                "换手率": number(38),
+                "市盈率-动态": number(39),
+                "市净率": number(46),
+                "总市值": number(44, 100_000_000),
+                "流通市值": number(45, 100_000_000),
+                "行情时间": values[30],
+            }
+        ]
+    )
+
+
+def get_financial_indicators(symbol: str, start_year: str, ttl_seconds: int = 24 * 3600, force_refresh: bool = False) -> pd.DataFrame:
+    symbol = _plain_symbol(symbol)
+    # 财务指标缓存改为“无 TTL 常驻”；ttl_seconds 参数仅保留兼容性
+    if force_refresh:
+        logger.info("🔄 强制刷新财务指标缓存: %s", symbol)
+
+    if not force_refresh:
+        cached = cache.fetch_records(
+            table="stock_financial_analysis_indicator",
+            filters={COL_CODE: symbol},
+            order_by=f'"{COL_DATE}" DESC',
+        )
+        if cached:
+            _log_cache_hit("stock_financial_analysis_indicator", symbol, len(cached))
+            return _records_to_df(cached)
+
+    df = _call_with_retry(
+        lambda: ak.stock_financial_analysis_indicator(symbol=symbol, start_year=start_year),
+        "stock_financial_analysis_indicator",
+    )
+    if df is None:
+        return pd.DataFrame()
+
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    df[COL_CODE] = symbol
+    cache.upsert_records(
+        "stock_financial_analysis_indicator",
+        df.to_dict("records"),
+        key_columns=[COL_CODE, COL_DATE],
+    )
+    _log_cache_upsert("stock_financial_analysis_indicator", symbol, len(df))
+    return df
+
+
+def get_financial_report(symbol: str, report_type: str, ttl_seconds: int = 7 * 24 * 3600, force_refresh: bool = False) -> pd.DataFrame:
+    symbol = _plain_symbol(symbol)
+    # 财务报表缓存改为“无 TTL 常驻”；ttl_seconds 参数仅保留兼容性
+    if force_refresh:
+        logger.info("🔄 强制刷新财务报表缓存: %s %s", symbol, report_type)
+
+    if not force_refresh:
+        cached = cache.fetch_records(
+            table="stock_financial_report_sina",
+            filters={COL_CODE: symbol, COL_REPORT_TYPE: report_type},
+        )
+        if cached:
+            _log_cache_hit(f"stock_financial_report_sina[{report_type}]", symbol, len(cached))
+            return _records_to_df(cached)
+
+    exchange_symbol = _resolve_exchange_symbol(symbol)
+    df = _call_with_retry(
+        lambda: ak.stock_financial_report_sina(stock=exchange_symbol, symbol=report_type),
+        "stock_financial_report_sina",
+    )
+    if df is None:
+        return pd.DataFrame()
+
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    if COL_REPORT_DATE in df.columns:
+        df[COL_REPORT_DATE] = pd.to_datetime(df[COL_REPORT_DATE]).dt.strftime("%Y-%m-%d")
+    df[COL_CODE] = symbol
+    df[COL_REPORT_TYPE] = report_type
+    cache.upsert_records(
+        "stock_financial_report_sina",
+        df.to_dict("records"),
+        key_columns=[COL_CODE, COL_REPORT_TYPE, COL_REPORT_DATE],
+    )
+    _log_cache_upsert(f"stock_financial_report_sina[{report_type}]", symbol, len(df))
+    return df
+
+
+def get_ttm_revenue(
+    symbol: str,
+    as_of_date: str,
+    *,
+    force_refresh: bool = False,
+) -> float | None:
+    """Calculate trailing-twelve-month revenue from cumulative China reports."""
+    frame = get_financial_report(symbol, "利润表", force_refresh=force_refresh)
+    if frame.empty or "报告日" not in frame:
+        return None
+    revenue_column = next((name for name in ("营业总收入", "营业收入") if name in frame), None)
+    if revenue_column is None:
+        return None
+
+    work = frame[["报告日", revenue_column]].copy()
+    work["报告日"] = pd.to_datetime(work["报告日"], errors="coerce")
+    work[revenue_column] = pd.to_numeric(work[revenue_column], errors="coerce")
+    cutoff = pd.to_datetime(as_of_date)
+    work = work[work["报告日"].notna() & work[revenue_column].notna() & (work["报告日"] <= cutoff)].sort_values("报告日", ascending=False)
+    if work.empty:
+        return None
+
+    latest = work.iloc[0]
+    latest_date = latest["报告日"]
+    latest_revenue = float(latest[revenue_column])
+    if latest_date.month == 12 and latest_date.day == 31:
+        return latest_revenue
+
+    annual_rows = work[(work["报告日"].dt.month == 12) & (work["报告日"].dt.day == 31) & (work["报告日"] < latest_date)]
+    prior_period_rows = work[(work["报告日"].dt.year == latest_date.year - 1) & (work["报告日"].dt.month == latest_date.month) & (work["报告日"].dt.day == latest_date.day)]
+    if not annual_rows.empty and not prior_period_rows.empty:
+        return latest_revenue + float(annual_rows.iloc[0][revenue_column]) - float(prior_period_rows.iloc[0][revenue_column])
+    if not annual_rows.empty:
+        return float(annual_rows.iloc[0][revenue_column])
+    return latest_revenue
+
+
+def get_fund_flow(
+    symbol: str,
+    ttl_seconds: int = 2 * 3600,
+    force_refresh: bool = False,
+) -> pd.DataFrame:
+    """Return recent Eastmoney capital-flow rows for one A-share stock."""
+    bs_symbol = format_symbol(symbol)
+    market, stock_code = bs_symbol.split(".", 1)
+    if market not in {"sh", "sz", "bj"}:
+        return pd.DataFrame()
+
+    if not force_refresh:
+        cached = cache.fetch_records(
+            table=FUND_FLOW_TABLE,
+            filters={COL_CODE: stock_code},
+            ttl_seconds=ttl_seconds,
+            order_by=f'"{COL_DATE}" ASC',
+        )
+        if cached:
+            _log_cache_hit(FUND_FLOW_TABLE, stock_code, len(cached))
+            return _records_to_df(cached)
+
+    df = _call_with_retry(
+        lambda: _query_fund_flow_http(stock_code, market),
+        "stock_individual_fund_flow",
+    )
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    df = df.copy()
+    if COL_DATE in df.columns:
+        df[COL_DATE] = pd.to_datetime(df[COL_DATE], errors="coerce").dt.strftime("%Y-%m-%d")
+    df[COL_CODE] = stock_code
+    cache.upsert_records(
+        FUND_FLOW_TABLE,
+        df.to_dict("records"),
+        key_columns=[COL_CODE, COL_DATE],
+    )
+    _log_cache_upsert(FUND_FLOW_TABLE, stock_code, len(df))
+    return df
+
+
+def _query_fund_flow_http(stock_code: str, market: str) -> pd.DataFrame:
+    """AkShare-compatible query using HTTP for proxies that reject HTTPS CONNECT."""
+    import requests
+
+    market_map = {"sh": 1, "sz": 0, "bj": 0}
+    url = "http://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"
+    params = {
+        "lmt": "0",
+        "klt": "101",
+        "secid": f"{market_map[market]}.{stock_code}",
+        "fields1": "f1,f2,f3,f7",
+        "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63,f64,f65",
+        "ut": "b2884a393a59ad64002292a3e90d46a5",
+        "_": int(time.time() * 1000),
+    }
+    response = requests.get(
+        url,
+        params=params,
+        timeout=15,
+        headers={
+            "User-Agent": "Mozilla/5.0",
+            "Referer": "https://data.eastmoney.com/",
+        },
+    )
+    response.raise_for_status()
+    payload = response.json().get("data") or {}
+    rows = payload.get("klines") or []
+    if not rows:
+        return pd.DataFrame()
+
+    frame = pd.DataFrame([item.split(",") for item in rows])
+    frame.columns = [
+        "日期",
+        "主力净流入-净额",
+        "小单净流入-净额",
+        "中单净流入-净额",
+        "大单净流入-净额",
+        "超大单净流入-净额",
+        "主力净流入-净占比",
+        "小单净流入-净占比",
+        "中单净流入-净占比",
+        "大单净流入-净占比",
+        "超大单净流入-净占比",
+        "收盘价",
+        "涨跌幅",
+        "-1",
+        "-2",
+    ]
+    frame = frame.drop(columns=["-1", "-2"])
+    frame["日期"] = pd.to_datetime(frame["日期"], errors="coerce").dt.strftime("%Y-%m-%d")
+    for column in frame.columns:
+        if column != "日期":
+            frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    return frame
+
+
+def _expected_trading_days(start_date: datetime, end_date: datetime) -> Sequence[pd.Timestamp]:
+    if start_date > end_date:
+        start_date, end_date = end_date, start_date
+    df = query_trade_dates(start_date, end_date)
+    if df.empty:
+        return pd.bdate_range(start=start_date, end=end_date)
+    df["calendar_date"] = pd.to_datetime(df["calendar_date"])
+    trading = df[df["is_trading_day"].astype(int) == 1]["calendar_date"].dt.normalize()
+    return trading.tolist()
+
+
+def _missing_segments(
+    expected_days: Sequence[pd.Timestamp],
+    cached_days: Sequence[pd.Timestamp],
+) -> List[Tuple[pd.Timestamp, pd.Timestamp]]:
+    cached_set = {day.normalize() for day in cached_days}
+    segments: List[Tuple[pd.Timestamp, pd.Timestamp]] = []
+    seg_start: Optional[pd.Timestamp] = None
+    seg_end: Optional[pd.Timestamp] = None
+    for day in expected_days:
+        normalized = day.normalize()
+        if normalized not in cached_set:
+            if seg_start is None:
+                seg_start = day
+            seg_end = day
+        elif seg_start is not None:
+            segments.append((seg_start, seg_end))
+            seg_start = seg_end = None
+    if seg_start is not None:
+        segments.append((seg_start, seg_end or seg_start))
+    return segments
+
+
+def _prepare_history_frame(raw_df: pd.DataFrame, symbol: str, adjust: str) -> pd.DataFrame:
+    if raw_df.empty:
+        return pd.DataFrame()
+    numeric_cols = ["open", "high", "low", "close", "preclose", "volume", "amount"]
+    for col in numeric_cols:
+        raw_df[col] = pd.to_numeric(raw_df[col], errors="coerce")
+    raw_df["pct_change"] = pd.to_numeric(raw_df["pctChg"], errors="coerce") / 100.0
+    raw_df["turnover"] = pd.to_numeric(raw_df["turn"], errors="coerce") / 100.0
+    raw_df["change_amount"] = raw_df["close"] - raw_df["preclose"]
+    base = raw_df["preclose"].replace(0, pd.NA)
+    raw_df["amplitude"] = ((raw_df["high"] - raw_df["low"]) / base) * 100
+    raw_df["amplitude"] = raw_df["amplitude"].fillna(0)
+    raw_df["date"] = pd.to_datetime(raw_df["date"])
+    raw_df["symbol"] = symbol
+    raw_df["adjust_flag"] = adjust or ""
+    columns = [
+        "symbol",
+        "adjust_flag",
+        "date",
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "amount",
+        "amplitude",
+        "pct_change",
+        "change_amount",
+        "turnover",
+    ]
+    return raw_df[columns]
+
+
+def _cache_history_rows(df: pd.DataFrame) -> None:
+    if df.empty:
+        return
+    cache.upsert_records(
+        HISTORY_TABLE,
+        df.to_dict("records"),
+        key_columns=["symbol", "adjust_flag", "date"],
+    )
+    _log_cache_upsert(HISTORY_TABLE, df.iloc[0]["symbol"], len(df))
+
+
+def get_price_history_df(
+    symbol: str,
+    start_date: datetime,
+    end_date: datetime,
+    adjust: str = "qfq",
+    ttl_seconds: Optional[int] = None,  # kept for backward compatibility, unused
+    force_refresh: bool = False,
+) -> pd.DataFrame:
+    symbol = _plain_symbol(symbol)
+    if force_refresh:
+        logger.info("🔄 强制刷新历史K线缓存: %s", symbol)
+
+    filters = {"symbol": symbol, "adjust_flag": adjust or ""}
+    cached_records = (
+        []
+        if force_refresh
+        else cache.fetch_records(
+            table=HISTORY_TABLE,
+            filters=filters,
+            order_by='"date" ASC',
+        )
+    )
+
+    cached_frames: List[pd.DataFrame] = []
+    cached_dates: List[pd.Timestamp] = []
+    if cached_records:
+        df_cached = _records_to_df(cached_records)
+        if not df_cached.empty:
+            df_cached["date"] = pd.to_datetime(df_cached["date"])
+            cached_frames.append(df_cached)
+            cached_dates = list(df_cached["date"].dt.normalize())
+
+    expected_days = _expected_trading_days(start_date, end_date)
+    missing_segments = _missing_segments(expected_days, cached_dates)
+    if not missing_segments:
+        logger.info(
+            "📦 Price history cache satisfied for %s（%d 个交易日）",
+            symbol,
+            len(expected_days),
+        )
+    else:
+        missing_days = sum((seg_end - seg_start).days + 1 for seg_start, seg_end in missing_segments)
+        logger.info(
+            "🔄 Price history cache 缺少 %d 个交易日，共 %d 个区间，正在增量拉取 %s",
+            missing_days,
+            len(missing_segments),
+            symbol,
+        )
+
+    new_frames: List[pd.DataFrame] = []
+    for seg_start, seg_end in missing_segments:
+        raw = query_history_k_data_plus(
+            symbol=symbol,
+            start_date=seg_start.strftime("%Y-%m-%d"),
+            end_date=seg_end.strftime("%Y-%m-%d"),
+            adjust=adjust,
+        )
+        prepared = _prepare_history_frame(raw, symbol, adjust)
+        if not prepared.empty:
+            _cache_history_rows(prepared)
+            new_frames.append(prepared)
+
+    if not cached_frames and not new_frames:
+        return pd.DataFrame()
+
+    combined = pd.concat(cached_frames + new_frames, ignore_index=True)
+    combined.drop_duplicates(subset=["symbol", "adjust_flag", "date"], keep="last", inplace=True)
+    mask = (combined["date"] >= pd.to_datetime(start_date)) & (combined["date"] <= pd.to_datetime(end_date))
+    result = combined.loc[mask].copy()
+    result.sort_values("date", inplace=True)
+    source_tag = "📊 数据来源: 缓存" if not new_frames else "📊 数据来源: 缓存+增量刷新"
+    logger.info("%s，标的=%s，输出行数=%d", source_tag, symbol, len(result))
+    return result
+
+
+def _normalize_date_str(value: str) -> str:
+    value = (value or "").strip()
+    if len(value) >= 10 and value[4] == "-" and value[7] == "-":
+        return value[:10]
+    return value
+
+
+def get_stock_news(
+    symbol: str,
+    *,
+    date: Optional[str] = None,
+    ttl_seconds: int = 2 * 3600,
+    force_refresh: bool = False,
+) -> pd.DataFrame:
+    """
+    获取新闻并缓存到 SQLite。
+
+    缓存 key（命中维度）按“标的 + 日期”进行过滤，避免跨日期误命中。
+    - date=None：默认使用今天（UTC+0 的 date string），并应用 ttl_seconds
+    - date=YYYY-MM-DD：按指定日期命中；历史日期不使用 TTL（视为稳定）
+    """
+    symbol = _plain_symbol(symbol)
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    date_str = _normalize_date_str(date or today_str)
+    effective_ttl = ttl_seconds if date is None or date_str == today_str else None
+
+    if force_refresh:
+        logger.info("🔄 强制刷新新闻缓存(stock_news_em): %s %s", symbol, date_str)
+
+    if not force_refresh:
+        cached = cache.fetch_records(
+            table=STOCK_NEWS_EM_TABLE,
+            filters={COL_KEYWORD: symbol, COL_CACHE_DATE: date_str},
+            ttl_seconds=effective_ttl,
+            limit=1,
+        )
+        if cached:
+            _log_cache_hit(STOCK_NEWS_EM_TABLE, symbol, len(cached))
+            record = dict(cached[0])
+            news_json = record.get("news_json")
+            if news_json:
+                try:
+                    records = json.loads(news_json)
+                    return pd.DataFrame(records)
+                except Exception:
+                    return pd.DataFrame()
+
+    df = _call_with_retry(lambda: ak.stock_news_em(symbol=symbol), "stock_news_em")
+    if df is None:
+        return pd.DataFrame()
+
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    df[COL_KEYWORD] = symbol
+    # 为缓存命中增加“日期”维度
+    if COL_PUBLISH_TIME in df.columns:
+        df[COL_CACHE_DATE] = df[COL_PUBLISH_TIME].astype(str).str.slice(0, 10)
+    else:
+        df[COL_CACHE_DATE] = date_str
+
+    # 只缓存目标日期的数据（避免把历史/其它日期混入当天 cache key）
+    df = df[df[COL_CACHE_DATE] == date_str].copy()
+    if df.empty:
+        return pd.DataFrame()
+
+    record = {
+        COL_KEYWORD: symbol,
+        COL_CACHE_DATE: date_str,
+        "news_json": json.dumps(df.to_dict("records"), ensure_ascii=False),
+        "news_count": len(df),
+    }
+    cache.upsert_records(
+        STOCK_NEWS_EM_TABLE,
+        [record],
+        key_columns=[COL_KEYWORD, COL_CACHE_DATE],
+    )
+    _log_cache_upsert(STOCK_NEWS_EM_TABLE, symbol, len(df))
+    return df

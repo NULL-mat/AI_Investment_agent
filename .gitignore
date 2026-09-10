@@ -46,6 +46,7 @@ Thumbs.db
 
 # Txt files
 *.txt
+!ashare_extension/requirements.txt
 
 # PDF files
 *.pdf
@@ -53,6 +54,11 @@ Thumbs.db
 # Outputs
 outputs/
 /scratchpad/
+
+# A-share and local test runtime caches
+*.db
+.pytest-run/
+.pytest-tmp/
 
 # Personal fund mandates and caches (live in ~/.hedge-fund/ now; stale
 # sessions running pre-2.1 code may still write here)
