@@ -1560,3 +1560,52 @@ URL（去除追踪参数）、标题和正文均参与指纹去重；日期窗�
 
 本次只修改 A 股扩展调用适配器、公共基础设施、新闻模块、测试、依赖和本说明文档；
 `hedge_fund/` 核心主流程保持不变。
+
+## 新增：TradingAgents 多数据源集成（第一阶段）
+
+第一阶段没有复制或修改 `TradingAgents/` 源码，而是在独立的
+`tradingagents_extension/` 中建立多源数据汇聚层。目标是保留更多数据渠道，同时让每个
+来源都可追溯、可单独失败，并遵守同一个 `as_of_date`。
+
+当前可接入的来源包括：
+
+- `ashare`：当前项目的 AkShare/BaoStock A 股适配器；
+- `financial_datasets`：当前 `hedge_fund` 的 Financial Datasets 客户端；
+- `tradingagents`：TradingAgents 自身的 yfinance、Alpha Vantage 和 FRED dataflows；
+- `news_engine`：当前项目的 Tavily/正文抓取/缓存 News Engine。
+
+主要接口是 `MultiSourceDataHub`：
+
+```python
+from tradingagents_extension import MultiSourceDataHub
+
+hub = MultiSourceDataHub.default()
+prices = hub.prices("600000", "2026-09-01", "2026-09-10", require_data=False)
+fundamentals = hub.fundamentals("600000", "2026-09-10", require_data=False)
+news = hub.news("600000", "2026-09-03", "2026-09-10", limit=20, require_data=False)
+```
+
+返回的 `DataBundle` 保留 `SourceEvidence(provider, kind, ticker, as_of_date, payload,
+retrieved_at, metadata)`。同一类数据可以同时保留多个成功来源，例如 A 股行情、Financial
+Datasets 行情和 yfinance 行情，而不是后一个来源覆盖前一个来源。失败来源会进入
+`SourceFailure`；如果要求数据且所有来源都没有有效结果，则抛出 `MultiSourceDataError`，
+不会生成伪造数据。
+
+`TradingAgents` 目录仍作为可选的 sibling checkout，适配器按需加载其 `VENDOR_METHODS`，
+因此 TradingAgents 缺少依赖或某个 API Key 时，只影响该来源，不会阻止当前 A 股和核心项目
+导入。当前阶段只完成数据获取和证据汇聚，尚未把 TradingAgents 的 Trader、Risk、Portfolio
+Manager 接入当前交易决策；下一阶段将先定义结构化 `ResearchPacket`，再将研究结果转换为
+当前 `hedge_fund.Signal`。
+
+### 第一阶段实现补充
+
+本阶段的 TradingAgents 适配器只放在 `tradingagents_extension/`，没有修改
+`hedge_fund/`、`TradingAgents/` 或 `A_Share_investment_Agent/` 的源码。适配器对
+TradingAgents 的每个 vendor 独立调用：某个 yfinance 或 Alpha Vantage 调用失败时，成功的
+同伴仍会保留，失败类型会写入 `SourceEvidence.metadata["vendor_failures"]`；所有 vendor
+失败时抛出 `TradingAgentsVendorError`，由 `MultiSourceDataHub` 记录为明确的来源失败。
+
+TradingAgents 返回的网络错误字符串会在扩展层拦截，避免把错误文本当作行情、基本面或新闻
+证据；明确的无数据响应则按正常空结果处理。`get_news(..., limit=N)` 会对 yfinance 的
+Markdown 和 Alpha Vantage 的 `feed` 列表执行数量限制。对 pandas 等带有 `empty` 属性的
+返回值使用类型安全判断，不调用会产生歧义的 DataFrame 布尔值。

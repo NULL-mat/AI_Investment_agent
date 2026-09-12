@@ -12,7 +12,8 @@ packages = [
     { include = "hedge_fund", from = "." },
     { include = "infrastructure", from = "." },
     { include = "news", from = "." },
-    { include = "ashare_extension", from = "." }
+    { include = "ashare_extension", from = "." },
+    { include = "tradingagents_extension", from = "." }
 ]
 exclude = [
     "hedge_fund/**/test_*.py",
